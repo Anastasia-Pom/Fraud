@@ -88,9 +88,9 @@ This study confirms that the Random Forest algorithm is highly effective for cre
 ```text
 .
 ├── README.md
-├── Lab8_Fraud_Detection.ipynb   # Main Colab Notebook
-├── requirements.txt              # Python dependencies
-└── images/                       # Folder for plots and metrics
+├── Fraud_detection.ipynb   
+├── requirements.txt              
+└── images/                     
     ├── lr_confusion_matrix.png
     ├── rf_confusion_matrix.png
     └── feature_importance.png
