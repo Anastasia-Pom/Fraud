@@ -58,13 +58,15 @@ The models were evaluated on a test set of 113,726 transactions. The results are
 *Table 1: Comparative performance metrics of the evaluated models.*
 
 ### 5.2 Confusion Matrices
-*(Add your screenshot files to an `images/` folder in the repository to display them here)*
 
 ![Confusion Matrix - Logistic Regression](images/lr_confusion_matrix.png)
 *Figure 1: Logistic Regression Confusion Matrix*
 
 ![Confusion Matrix - Random Forest](images/rf_confusion_matrix.png)
 *Figure 2: Random Forest Confusion Matrix (Note: 0 False Negatives)*
+
+![Confusion Matrix - Decision Tree](images/dt_confusion_matrix.png)
+*Figure 3: Decision Tree Confusion Matrix*
 
 ### 5.3 Feature Importance
 The Random Forest model identified the following top 5 most discriminative features: **V10, V14, V4, V12, V11**.
