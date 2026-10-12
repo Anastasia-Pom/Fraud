@@ -1,7 +1,7 @@
 # Credit Card Fraud Detection: A Comparative Analysis of Machine Learning Models
 
 ## Abstract
-This study evaluates the performance of three machine learning algorithms—Logistic Regression, Decision Tree, and Random Forest—for detecting fraudulent credit card transactions. Using the 2023 Credit Card Fraud Detection dataset, we address a binary classification problem. Experimental results demonstrate that the Random Forest classifier achieves near-perfect performance with an accuracy of 0.9998 and a ROC AUC of 1.0000, significantly outperforming the baseline Logistic Regression (Accuracy: 0.9649, ROC AUC: 0.9935).
+This study evaluates the performance of three machine learning algorithms—Logistic Regression, Decision Tree, and Random Forest-for detecting fraudulent credit card transactions. Using the 2023 Credit Card Fraud Detection dataset, we address a binary classification problem. Experimental results demonstrate that the Random Forest classifier achieves near-perfect performance with an accuracy of 0.9998 and a ROC AUC of 1.0000, significantly outperforming the baseline Logistic Regression (Accuracy: 0.9649, ROC AUC: 0.9935).
 
 ## 1. Introduction
 Credit card fraud detection is a critical task in financial security. The primary challenge lies in accurately identifying fraudulent transactions while minimizing false positives (blocking legitimate users) and false negatives (missing fraud). This repository contains the implementation and evaluation of three models, structured as a standard machine learning pipeline.
