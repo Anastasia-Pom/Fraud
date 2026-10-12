@@ -16,21 +16,26 @@ Credit card fraud detection is a critical task in financial security. The primar
 
 ### 3.1 Data Preprocessing
 The `id` column was dropped as it holds no predictive value. The `Amount` feature was standardized to zero mean and unit variance using `StandardScaler`:
-$$ z = \frac{x - \mu}{\sigma} $$
+
+$$z = \frac{x - \mu}{\sigma}$$
+
 where $\mu$ is the mean and $\sigma$ is the standard deviation of the training data. The dataset was split into 80% training and 20% testing sets using stratified sampling to preserve the class ratio.
 
 ### 3.2 Machine Learning Models
 1. **Logistic Regression:** A linear model that estimates the probability of fraud using the sigmoid function:
-   $$ P(y=1|X) = \frac{1}{1 + e^{-(\beta_0 + \beta^T X)}} $$
+
+$$P(y=1|X) = \frac{1}{1 + e^{-(\beta_0 + \beta^T X)}}$$
+
 2. **Decision Tree:** A non-parametric model that recursively splits the feature space using Gini impurity to maximize information gain.
 3. **Random Forest:** An ensemble method that constructs multiple decision trees and aggregates their predictions to reduce variance and prevent overfitting.
 
 ### 3.3 Evaluation Metrics
 Model performance was evaluated using the following metrics:
-- **Accuracy:** $Accuracy = \frac{TP + TN}{TP + TN + FP + FN}$
-- **Precision:** $Precision = \frac{TP}{TP + FP}$
-- **Recall (Sensitivity):** $Recall = \frac{TP}{TP + FN}$
-- **F1-Score:** $F1 = 2 \times \frac{Precision \times Recall}{Precision + Recall}$
+
+- **Accuracy:** $\text{Accuracy} = \frac{TP + TN}{TP + TN + FP + FN}$
+- **Precision:** $\text{Precision} = \frac{TP}{TP + FP}$
+- **Recall (Sensitivity):** $\text{Recall} = \frac{TP}{TP + FN}$
+- **F1-Score:** $\text{F1} = 2 \times \frac{\text{Precision} \times \text{Recall}}{\text{Precision} + \text{Recall}}$
 - **ROC AUC:** Area under the Receiver Operating Characteristic curve, representing the model's ability to distinguish between classes.
 
 ## 4. Experimental Setup
