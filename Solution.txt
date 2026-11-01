@@ -1,0 +1,297 @@
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+import xgboost as xgb
+from catboost import CatBoostRegressor
+from sklearn.metrics import mean_squared_log_error
+import warnings, os, random, time, gc
+
+warnings.filterwarnings('ignore')
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    def tqdm(x, **kw): return x
+
+SEED = 42
+np.random.seed(SEED)
+random.seed(SEED)
+os.environ['PYTHONHASHSEED'] = str(SEED)
+
+_T0 = time.time()
+def log(msg):
+    print(f"[{time.time()-_T0:7.1f}s] {msg}", flush=True)
+
+# Set to True for faster training (trains on 2017+ only, loses ~0.005 accuracy)
+FAST_MODE = False 
+
+log("Loading data...")
+DATA_PATH = '/kaggle/input/store-sales-time-series-forecasting/'
+train = pd.read_csv(DATA_PATH + 'train.csv', parse_dates=['date'])
+test = pd.read_csv(DATA_PATH + 'test.csv', parse_dates=['date'])
+stores = pd.read_csv(DATA_PATH + 'stores.csv')
+oil = pd.read_csv(DATA_PATH + 'oil.csv', parse_dates=['date'])
+holidays = pd.read_csv(DATA_PATH + 'holidays_events.csv', parse_dates=['date'])
+transactions = pd.read_csv(DATA_PATH + 'transactions.csv', parse_dates=['date'])
+
+train = train.merge(stores, on='store_nbr', how='left')
+test = test.merge(stores, on='store_nbr', how='left')
+
+oil = oil.rename(columns={'dcoilwtico': 'oil_price'})
+oil['oil_price'] = oil['oil_price'].ffill().bfill()
+train = train.merge(oil[['date', 'oil_price']], on='date', how='left')
+test = test.merge(oil[['date', 'oil_price']], on='date', how='left')
+
+trans = transactions.sort_values(['store_nbr', 'date']).reset_index(drop=True)
+trans['trans_lag_16'] = trans.groupby('store_nbr')['transactions'].shift(16)
+train = train.merge(trans[['date', 'store_nbr', 'transactions', 'trans_lag_16']], on=['date', 'store_nbr'], how='left')
+
+tr_shift = trans[['store_nbr', 'date', 'transactions']].copy()
+tr_shift['date'] = tr_shift['date'] + pd.Timedelta(days=16)
+tr_shift = tr_shift.rename(columns={'transactions': 'trans_lag_16'})
+test = test.drop(columns=['transactions', 'trans_lag_16'], errors='ignore')
+test = test.merge(tr_shift, on=['store_nbr', 'date'], how='left')
+
+trans_median = train.groupby('store_nbr')['transactions'].median()
+test['transactions'] = test['store_nbr'].map(trans_median)
+for col in ['transactions', 'trans_lag_16']:
+    med = train.groupby('store_nbr')[col].transform('median')
+    train[col] = train[col].fillna(med)
+test['trans_lag_16'] = test['trans_lag_16'].fillna(test['store_nbr'].map(train.groupby('store_nbr')['trans_lag_16'].median()))
+
+holidays_clean = holidays[~holidays['type'].isin(['Transfer', 'Bridge', 'Work Day'])]
+holiday_dates = holidays_clean['date'].unique()
+for df in [train, test]:
+    df['is_holiday'] = df['date'].isin(holiday_dates).astype(int)
+    df['day_after_holiday'] = (df['date'] - pd.Timedelta(days=1)).isin(holiday_dates).astype(int)
+    df['day_before_holiday'] = (df['date'] + pd.Timedelta(days=1)).isin(holiday_dates).astype(int)
+    df['is_payday'] = ((df['date'].dt.day == 15) | (df['date'].dt.is_month_end)).astype(int)
+    df['is_earthquake'] = ((df['date'] >= pd.Timestamp('2016-04-16')) & (df['date'] <= pd.Timestamp('2016-05-15'))).astype(int)
+
+def create_date_features(df):
+    df['year'] = df['date'].dt.year
+    df['month'] = df['date'].dt.month
+    df['day'] = df['date'].dt.day
+    df['dayofweek'] = df['date'].dt.dayofweek
+    df['weekofyear'] = df['date'].dt.isocalendar().week.astype(int)
+    df['day_of_year'] = df['date'].dt.dayofyear
+    df['is_weekend'] = (df['dayofweek'] >= 5).astype(int)
+    for k in range(1, 4):
+        df[f'fourier_w_sin_{k}'] = np.sin(2 * np.pi * k * df['dayofweek'] / 7)
+        df[f'fourier_w_cos_{k}'] = np.cos(2 * np.pi * k * df['dayofweek'] / 7)
+        df[f'fourier_y_sin_{k}'] = np.sin(2 * np.pi * k * df['day_of_year'] / 365.25)
+        df[f'fourier_y_cos_{k}'] = np.cos(2 * np.pi * k * df['day_of_year'] / 365.25)
+    return df
+train = create_date_features(train)
+test = create_date_features(test)
+
+log("Generating features...")
+train = train.sort_values(['store_nbr', 'family', 'date']).reset_index(drop=True)
+test = test.sort_values(['store_nbr', 'family', 'date']).reset_index(drop=True)
+train['sales_log'] = np.log1p(train['sales'])
+
+for lag in [1, 7, 14, 21, 28, 364]:
+    train[f'sales_lag_{lag}'] = train.groupby(['store_nbr', 'family'])['sales'].shift(lag)
+
+train['promo_roll_7'] = train.groupby(['store_nbr', 'family'])['onpromotion'].transform(lambda x: x.rolling(7, min_periods=1).sum())
+train['promo_roll_14'] = train.groupby(['store_nbr', 'family'])['onpromotion'].transform(lambda x: x.rolling(14, min_periods=1).sum())
+
+max_date = train['date'].max()
+val_start = max_date - pd.Timedelta(days=15)
+train_part = train[train['date'] < val_start].copy()
+val_part = train[train['date'] >= val_start].copy()
+
+dow_mean = train_part.groupby(['store_nbr', 'family', 'dayofweek'])['sales_log'].mean().reset_index()
+dow_mean.rename(columns={'sales_log': 'sf_dow_mean'}, inplace=True)
+
+val_part = val_part.merge(dow_mean, on=['store_nbr', 'family', 'dayofweek'], how='left')
+test = test.merge(dow_mean, on=['store_nbr', 'family', 'dayofweek'], how='left')
+train_part = train_part.merge(dow_mean, on=['store_nbr', 'family', 'dayofweek'], how='left')
+for df in [train_part, val_part, test]:
+    df['sf_dow_mean'] = df['sf_dow_mean'].fillna(0)
+
+test['sales_lag_364'] = test.merge(
+    train_part[['date', 'store_nbr', 'family', 'sales']],
+    left_on=[test['date'] - pd.Timedelta(days=364), 'store_nbr', 'family'],
+    right_on=['date', 'store_nbr', 'family'], how='left'
+)['sales'].values
+test['sales_lag_364'] = test['sales_lag_364'].fillna(0)
+
+last_train_date = train['date'].max()
+hist_promo = train.loc[train['date'] > last_train_date - pd.Timedelta(days=14), ['store_nbr', 'family', 'date', 'onpromotion']].copy()
+hist_promo['_src'] = 0
+test_promo = test[['store_nbr', 'family', 'date', 'onpromotion']].copy()
+test_promo['_src'] = 1
+comb = pd.concat([hist_promo, test_promo], ignore_index=True).sort_values(['store_nbr', 'family', 'date'])
+comb['promo_roll_7'] = comb.groupby(['store_nbr', 'family'])['onpromotion'].transform(lambda x: x.rolling(7, min_periods=1).sum())
+comb['promo_roll_14'] = comb.groupby(['store_nbr', 'family'])['onpromotion'].transform(lambda x: x.rolling(14, min_periods=1).sum())
+new_promo = comb.loc[comb['_src'] == 1, ['store_nbr', 'family', 'date', 'promo_roll_7', 'promo_roll_14']]
+test = test.drop(columns=['promo_roll_7', 'promo_roll_14'], errors='ignore').merge(new_promo, on=['store_nbr', 'family', 'date'], how='left')
+test[['promo_roll_7', 'promo_roll_14']] = test[['promo_roll_7', 'promo_roll_14']].fillna(0)
+
+train = pd.concat([train_part, val_part], ignore_index=True).sort_values(['date', 'store_nbr', 'family'])
+del train_part, val_part, comb, hist_promo, test_promo, new_promo
+gc.collect()
+
+cat_cols = ['family', 'city', 'state', 'type']
+features = [
+    'store_nbr', 'family', 'onpromotion', 'city', 'state', 'type', 'cluster',
+    'oil_price', 'transactions', 'trans_lag_16',
+    'is_holiday', 'day_after_holiday', 'day_before_holiday', 'is_payday', 'is_earthquake',
+    'year', 'month', 'day', 'dayofweek', 'weekofyear', 'is_weekend',
+    'fourier_w_sin_1', 'fourier_w_cos_1', 'fourier_w_sin_2', 'fourier_w_cos_2',
+    'fourier_y_sin_1', 'fourier_y_cos_1', 'fourier_y_sin_2', 'fourier_y_cos_2',
+    'sales_lag_1', 'sales_lag_7', 'sales_lag_14', 'sales_lag_21', 'sales_lag_28', 'sales_lag_364',
+    'sf_dow_mean', 'promo_roll_7', 'promo_roll_14'
+]
+
+lag_cols = [f'sales_lag_{lag}' for lag in [1, 7, 14, 21, 28]]
+train_model = train.dropna(subset=lag_cols).copy()
+
+if FAST_MODE:
+    log("FAST_MODE: trimming train to 2017-01-01")
+    train_model = train_model[train_model['date'] >= '2017-01-01'].copy()
+
+train_data = train_model[train_model['date'] < val_start].copy()
+val_data = train_model[train_model['date'] >= val_start].copy()
+log(f"  X_train rows={len(train_data):,}, X_val rows={len(val_data):,}")
+
+cat_categories = {}
+for col in cat_cols:
+    cat_categories[col] = train_model[col].astype('category').cat.categories
+    train_data[col] = pd.Categorical(train_data[col], categories=cat_categories[col])
+    val_data[col] = pd.Categorical(val_data[col], categories=cat_categories[col])
+
+X_train, y_train = train_data[features], train_data['sales_log']
+X_val, y_val = val_data[features], val_data['sales_log']
+
+models = {}
+NUM_ROUNDS = 3000 if FAST_MODE else 4000
+ES_ROUNDS  = 100  if FAST_MODE else 150
+
+log("Training LGB...")
+lgb_params = {'objective': 'regression', 'metric': 'rmse', 
+              'num_leaves': 127 if FAST_MODE else 255, 'min_data_in_leaf': 20, 
+              'learning_rate': 0.03, 'feature_fraction': 0.7, 'bagging_fraction': 0.8, 
+              'random_state': SEED, 'n_jobs': -1, 'verbose': -1}
+dtrain = lgb.Dataset(X_train, y_train, categorical_feature=cat_cols)
+dval = lgb.Dataset(X_val, y_val, reference=dtrain, categorical_feature=cat_cols)
+models['lgb'] = lgb.train(lgb_params, dtrain, NUM_ROUNDS, valid_sets=[dval], 
+                          callbacks=[lgb.early_stopping(ES_ROUNDS), lgb.log_evaluation(100)])
+log(f"  LGB done, best_iter={models['lgb'].best_iteration}")
+
+log("Training XGB...")
+X_train_xgb = X_train.copy(); X_val_xgb = X_val.copy()
+for col in cat_cols:
+    X_train_xgb[col] = X_train_xgb[col].cat.codes
+    X_val_xgb[col] = X_val_xgb[col].cat.codes
+xgb_params = {'objective': 'reg:squarederror', 'tree_method': 'hist', 'max_depth': 6 if FAST_MODE else 7,
+              'learning_rate': 0.03, 'subsample': 0.8, 'colsample_bytree': 0.8, 
+              'min_child_weight': 20, 'reg_lambda': 2.0, 'n_estimators': NUM_ROUNDS, 
+              'early_stopping_rounds': ES_ROUNDS, 'random_state': SEED, 'n_jobs': -1, 'verbosity': 1}
+models['xgb'] = xgb.XGBRegressor(**xgb_params)
+models['xgb'].fit(X_train_xgb, y_train, eval_set=[(X_val_xgb, y_val)], verbose=100)
+log(f"  XGB done, best_iter={models['xgb'].best_iteration}")
+
+log("Training CB...")
+X_train_cb = X_train.copy(); X_val_cb = X_val.copy()
+for col in cat_cols:
+    X_train_cb[col] = X_train_cb[col].astype(str)
+    X_val_cb[col] = X_val_cb[col].astype(str)
+cat_idx = [X_train_cb.columns.get_loc(c) for c in cat_cols]
+models['cb'] = CatBoostRegressor(iterations=NUM_ROUNDS, learning_rate=0.03, depth=7 if FAST_MODE else 8, l2_leaf_reg=5.0,
+                                 loss_function='RMSE', random_seed=SEED, od_type='Iter', od_wait=ES_ROUNDS, verbose=100, thread_count=-1)
+models['cb'].fit(X_train_cb, y_train, eval_set=(X_val_cb, y_val), cat_features=cat_idx, use_best_model=True)
+log(f"  CB done, best_iter={models['cb'].get_best_iteration()}")
+
+log("Finding best weights...")
+pred_lgb_log = models['lgb'].predict(X_val, num_iteration=models['lgb'].best_iteration)
+pred_xgb_log = models['xgb'].predict(X_val_xgb)
+pred_cb_log  = models['cb'].predict(X_val_cb)
+
+best_score = 1.0
+best_weights = (1/3, 1/3, 1/3)
+for w1 in np.arange(0.1, 0.91, 0.05):
+    for w2 in np.arange(0.0, 1.0 - w1 + 1e-9, 0.05):
+        w3 = 1.0 - w1 - w2
+        if w3 < -1e-9: continue
+        blend = np.clip(np.expm1(w1*pred_lgb_log + w2*pred_xgb_log + w3*pred_cb_log), 0, None)
+        score = np.sqrt(mean_squared_log_error(np.expm1(y_val), blend))
+        if score < best_score:
+            best_score = score
+            best_weights = (w1, w2, w3)
+log(f"  Weights: LGB={best_weights[0]:.2f}, XGB={best_weights[1]:.2f}, CB={best_weights[2]:.2f} | val RMSLE={best_score:.5f}")
+
+log("Preparing recent_sales cache...")
+recent_sales = {(s, f): g['sales'].tail(100).tolist() for (s, f), g in train.sort_values('date').groupby(['store_nbr', 'family'])}
+numeric_features = [f for f in features if f not in cat_cols]
+
+def recursive_forecast(model_name):
+    current_model = models[model_name]
+    recent = {k: list(v) for k, v in recent_sales.items()}
+    df = test.copy()
+    all_days = sorted(df['date'].unique())
+    preds_all = []
+    
+    day_iter = tqdm(all_days, desc=f"  {model_name}", unit="day", ncols=90, leave=False)
+    for day in day_iter:
+        day_data = df[df['date'] == day].reset_index(drop=True)
+        n = len(day_data)
+        keys = list(zip(day_data['store_nbr'].values, day_data['family'].values))
+
+        for lag in [1, 7, 14, 21, 28]:
+            day_data[f'sales_lag_{lag}'] = np.fromiter(
+                (recent[k][-lag] if len(recent[k]) >= lag else 0.0 for k in keys), dtype=np.float32, count=n)
+
+        for col in numeric_features:
+            if col not in day_data.columns: day_data[col] = 0
+            day_data[col] = pd.to_numeric(day_data[col], errors='coerce').fillna(0)
+            
+        for col in cat_cols:
+            day_data[col] = pd.Categorical(day_data[col].astype(str), categories=cat_categories[col])
+
+        if model_name == 'lgb':
+            p_log = current_model.predict(day_data[features], num_iteration=current_model.best_iteration)
+        elif model_name == 'xgb':
+            d_x = day_data[features].copy()
+            for c in cat_cols: d_x[c] = d_x[c].cat.codes
+            p_log = current_model.predict(d_x)
+        else:
+            d_c = day_data[features].copy()
+            for c in cat_cols: d_c[c] = d_c[c].astype(str)
+            p_log = current_model.predict(d_c)
+
+        preds = np.clip(np.expm1(p_log), 0, None).astype(np.float32)
+        
+        for k, p in zip(keys, preds):
+            recent[k].append(float(p))
+            
+        preds_all.append(pd.DataFrame({'id': day_data['id'].values, 'pred': preds}))
+        day_iter.set_postfix({'mean': f'{preds.mean():.1f}'})
+        
+    return pd.concat(preds_all, ignore_index=True)
+
+log("Forecast LGB...")
+res_lgb = recursive_forecast('lgb')
+log("Forecast XGB...")
+res_xgb = recursive_forecast('xgb')
+log("Forecast CB...")
+res_cb = recursive_forecast('cb')
+
+log("Merging predictions...")
+merged = res_lgb.rename(columns={'pred': 'pred_lgb'})
+merged = merged.merge(res_xgb.rename(columns={'pred': 'pred_xgb'}), on='id')
+merged = merged.merge(res_cb.rename(columns={'pred': 'pred_cb'}), on='id')
+
+w1, w2, w3 = best_weights
+merged['sales_log'] = (w1 * np.log1p(merged['pred_lgb']) + w2 * np.log1p(merged['pred_xgb']) + w3 * np.log1p(merged['pred_cb']))
+merged['sales'] = np.clip(np.expm1(merged['sales_log']), 0, None)
+
+submission = merged[['id', 'sales']].sort_values('id').reset_index(drop=True)
+submission['id'] = submission['id'].astype(int)
+submission.to_csv('submission_optimized.csv', index=False)
+
+train_mean_30d = train.loc[train['date'] > train['date'].max() - pd.Timedelta(days=30), 'sales'].mean()
+log(f"train mean (30d): {train_mean_30d:.2f}")
+log(f"pred mean       : {submission['sales'].mean():.2f}")
+log(f"ratio pred/30d  : {submission['sales'].mean()/train_mean_30d:.3f}")
+log("✅ File submission_optimized.csv is ready!")
