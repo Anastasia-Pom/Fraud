@@ -51,4 +51,4 @@ To achieve this result, several popular techniques were tested and discarded due
 1. Clone the repository.
 2. Download the dataset from Kaggle and place it in the `../input/store-sales-time-series-forecasting/` directory.
 3. Install the dependencies: `pip install pandas numpy scikit-learn lightgbm xgboost catboost tqdm`.
-4. Run `solution.py`. The final submission will be generated as `submission_optimized.csv`.
+4. Run `solution.txt`. The final submission will be generated as `submission_optimized.csv`.
